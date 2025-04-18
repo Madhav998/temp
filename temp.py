@@ -1,187 +1,149 @@
-import os
 import subprocess
-import threading
 import logging
-import signal
-import sys
-from scapy.all import IP, TCP, Raw
+import os
+import time
 from netfilterqueue import NetfilterQueue
+import iptc
+from scapy.all import IP, TCP, UDP, Raw
 
-# 🔹 Logging Setup
-LOG_FILE = "/var/log/hybrid_firewall.log"
-
+# Configure logging to file and console
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s - %(message)s")
-file_handler = logging.FileHandler(LOG_FILE)
-file_handler.setFormatter(formatter)
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(formatter)
+file_handler = logging.FileHandler('firewall_log.log')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 logger.addHandler(file_handler)
-logger.addHandler(stream_handler)
 
-# 🔹 Load Blocklists
-def load_blocklist(file_path):
+# Blocklist file paths (add full paths if needed)
+BLOCKLIST_PATH = "/path/to/blocklists/"
+
+def load_blocklist(file_name):
     try:
-        with open(file_path, "r") as f:
+        with open(os.path.join(BLOCKLIST_PATH, file_name), "r") as f:
             return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        logger.error(f"[ERROR] Blocklist file not found: {file_path}")
+        logger.error(f"[ERROR] Blocklist file not found: {file_name}")
         return []
 
-def reload_blocklists():
-    global BLOCKED_IPS, BLOCKED_PORTS, BLOCKED_KEYWORDS, BLOCKED_SITES
-    BLOCKED_IPS = load_blocklist("blocked_ips.txt")
-    BLOCKED_PORTS = [int(port) for port in load_blocklist("blocked_ports.txt") if port.isdigit()]
-    BLOCKED_KEYWORDS = load_blocklist("blocked_keywords.txt")
-    BLOCKED_SITES = load_blocklist("blocked_sites.txt")
+# Load blocklists
+blocked_ips = load_blocklist("blocked_ips.txt")
+blocked_ports = load_blocklist("blocked_ports.txt")
+blocked_keywords = load_blocklist("blocked_keywords.txt")
+blocked_sites = load_blocklist("blocked_sites.txt")
 
-# Initial load
-reload_blocklists()
-
-# 🔹 Sanity Check
-def sanity_check():
-    required = ['iptables', 'fail2ban-client', 'squid']
-    for tool in required:
-        if subprocess.run(["which", tool], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0:
-            logger.warning(f"[WARNING] {tool} not found!")
-
-# 🔹 Configure iptables Rules
-def setup_iptables():
-    commands = [
-        ["sudo", "iptables", "-F"],
-        ["sudo", "iptables", "-P", "INPUT", "DROP"],
-        ["sudo", "iptables", "-P", "FORWARD", "DROP"],
-        ["sudo", "iptables", "-P", "OUTPUT", "ACCEPT"],
-        ["sudo", "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "22", "-m", "state", "--state", "NEW", "-m", "recent", "--set"],
-        ["sudo", "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "22", "-m", "state", "--state", "NEW", "-m", "recent", "--update", "--seconds", "60", "--hitcount", "4", "-j", "DROP"],
-        ["sudo", "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT"],
-        ["sudo", "iptables", "-A", "INPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-        ["sudo", "iptables", "-A", "INPUT", "-p", "tcp", "--syn", "-m", "limit", "--limit", "1/s", "--limit-burst", "3", "-j", "ACCEPT"],
-        ["sudo", "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "80", "-j", "NFQUEUE", "--queue-num", "1"],
-        ["sudo", "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "443", "-j", "NFQUEUE", "--queue-num", "1"],
-    ]
-
-    for ip in BLOCKED_IPS:
-        commands.append(["sudo", "iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"])
-        commands.append(["sudo", "iptables", "-A", "OUTPUT", "-d", ip, "-j", "DROP"])
-
-    for port in BLOCKED_PORTS:
-        commands.append(["sudo", "iptables", "-A", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "DROP"])
-
-    for cmd in commands:
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"[ERROR] Failed to apply iptables rule: {' '.join(cmd)} - {e}")
-
-    logger.info("[INFO] iptables rules finalized.")
-
-# 🔹 Packet Inspection & Filtering
-def inspect_packet(packet):
-    try:
-        scapy_pkt = IP(packet.get_payload())
-
-        if scapy_pkt.src in BLOCKED_IPS or scapy_pkt.dst in BLOCKED_IPS:
-            logger.warning(f"[BLOCKED] IP: {scapy_pkt.src} -> {scapy_pkt.dst}")
-            packet.drop()
-            return
-
-        if scapy_pkt.haslayer(TCP) and (
-            scapy_pkt[TCP].sport in BLOCKED_PORTS or scapy_pkt[TCP].dport in BLOCKED_PORTS):
-            logger.warning(f"[BLOCKED] Port: {scapy_pkt.src}:{scapy_pkt[TCP].sport} -> {scapy_pkt.dst}:{scapy_pkt[TCP].dport}")
-            packet.drop()
-            return
-
-        if scapy_pkt.haslayer(Raw):
-            try:
-                http_payload = scapy_pkt[Raw].load.decode("utf-8", errors="replace")
-                for keyword in BLOCKED_KEYWORDS:
-                    if keyword.lower() in http_payload.lower():
-                        logger.warning(f"[BLOCKED] Keyword Detected: {keyword}")
-                        packet.drop()
-                        return
-            except UnicodeDecodeError:
-                logger.error("[ERROR] Unicode decoding failed")
-
-        packet.accept()
-
-    except Exception as e:
-        logger.error(f"[ERROR] Packet inspection failed: {e}")
-        packet.accept()
-
-# 🔹 Fail2Ban Setup
-def setup_fail2ban():
-    try:
-        if subprocess.run(["which", "fail2ban-server"], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0:
-            subprocess.run(["sudo", "apt-get", "install", "fail2ban", "-y"], check=True)
-        subprocess.run(["sudo", "systemctl", "enable", "fail2ban"], check=True)
-        subprocess.run(["sudo", "systemctl", "start", "fail2ban"], check=True)
-        logger.info("[INFO] Fail2Ban is active.")
-    except Exception as e:
-        logger.error(f"[ERROR] Fail2Ban setup failed: {e}")
-
-# 🔹 Squid Proxy Setup
-def setup_squid_proxy():
-    try:
-        if subprocess.run(["which", "squid"], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0:
-            subprocess.run(["sudo", "apt-get", "install", "squid", "-y"], check=True)
-
-        with open("/etc/squid/blocked_sites.txt", "w") as f:
-            f.write("\n".join([f".{domain}" for domain in BLOCKED_SITES]))
-
-        squid_config = """
-http_port 3128
-acl allowed_ips src 192.168.56.0/24
-acl blocked_sites dstdomain "/etc/squid/blocked_sites.txt"
-http_access deny blocked_sites
-http_access allow allowed_ips
-http_access deny all
-"""
-        with open("/etc/squid/squid.conf", "w") as f:
-            f.write(squid_config)
-
-        subprocess.run(["sudo", "systemctl", "restart", "squid"], check=True)
-        logger.info("[INFO] Squid Proxy configured.")
-    except Exception as e:
-        logger.error(f"[ERROR] Squid Proxy setup failed: {e}")
-
-# 🔹 Update Blocklists from GitHub URLs
+# Automated update function to refresh blocklists
 def update_blocklists():
-    logger.info("[INFO] Updating blocklists...")
-    urls = {
-        "blocked_ips.txt": r"https://github.com/Madhav998/firewall/blob/main/blocked_ips.txt",
-        "blocked_ports.txt": r"https://github.com/Madhav998/firewall/blob/main/port%20list", 
-        "blocked_keywords.txt": r"https://github.com/Madhav998/firewall/blob/main/blocked_keywords.txt",
-        "blocked_sites.txt": r"https://github.com/Madhav998/firewall/blob/main/blocked_sites.txt"
-    }
+    logger.info("Checking for blocklist updates...")
+    try:
+        # Placeholder for actual blocklist update mechanism
+        # For example, downloading from a remote server
+        subprocess.run(["wget", "-q", "-O", os.path.join(BLOCKLIST_PATH, "blocked_ips.txt"), "http://example.com/blocked_ips.txt"], check=True)
+        subprocess.run(["wget", "-q", "-O", os.path.join(BLOCKLIST_PATH, "blocked_ports.txt"), "http://example.com/blocked_ports.txt"], check=True)
+        subprocess.run(["wget", "-q", "-O", os.path.join(BLOCKLIST_PATH, "blocked_keywords.txt"), "http://example.com/blocked_keywords.txt"], check=True)
+        subprocess.run(["wget", "-q", "-O", os.path.join(BLOCKLIST_PATH, "blocked_sites.txt"), "http://example.com/blocked_sites.txt"], check=True)
+        logger.info("Blocklists updated successfully.")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[ERROR] Blocklist update failed: {e}")
 
-    for filename, url in urls.items():
-        try:
-            temp_file = filename + ".tmp"
-            subprocess.run(["wget", "-O", temp_file, url], check=True)
-            os.replace(temp_file, filename)
-            logger.info(f"[INFO] Updated {filename}.")
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                f"[ERROR] Failed to update rules: {e}"
-            )
-# 🔹 Main Firewall Loop
-if __name__ == "__main__":
-    sanity_check()
-    update_blocklists()
-    reload_blocklists()
-    setup_fail2ban()
-    setup_squid_proxy()
-    setup_iptables()
+# Setup iptables for blocking traffic
+def setup_iptables():
+    logger.info("Setting up iptables...")
+    
+    try:
+        # Flush existing rules to avoid conflicts
+        subprocess.run(["iptables", "-F"], check=True)
 
+        # Set default policies to DROP
+        subprocess.run(["iptables", "-P", "INPUT", "DROP"], check=True)
+        subprocess.run(["iptables", "-P", "OUTPUT", "DROP"], check=True)
+        subprocess.run(["iptables", "-P", "FORWARD", "DROP"], check=True)
+        
+        # Allow loopback and established connections
+        subprocess.run(["iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT"], check=True)
+        subprocess.run(["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"], check=True)
+        subprocess.run(["iptables", "-A", "INPUT", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"], check=True)
+        subprocess.run(["iptables", "-A", "OUTPUT", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"], check=True)
+
+        # Block IPs in the blocklist
+        for ip in blocked_ips:
+            subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True)
+            subprocess.run(["iptables", "-A", "OUTPUT", "-d", ip, "-j", "DROP"], check=True)
+        
+        # Block ports in the blocklist
+        for port in blocked_ports:
+            subprocess.run(["iptables", "-A", "INPUT", "--dport", port, "-j", "DROP"], check=True)
+            subprocess.run(["iptables", "-A", "OUTPUT", "--sport", port, "-j", "DROP"], check=True)
+
+        # Allow HTTP/S traffic on ports 80, 443
+        subprocess.run(["iptables", "-A", "INPUT", "-p", "tcp", "--dport", "80", "-j", "ACCEPT"], check=True)
+        subprocess.run(["iptables", "-A", "OUTPUT", "-p", "tcp", "--sport", "80", "-j", "ACCEPT"], check=True)
+        subprocess.run(["iptables", "-A", "INPUT", "-p", "tcp", "--dport", "443", "-j", "ACCEPT"], check=True)
+        subprocess.run(["iptables", "-A", "OUTPUT", "-p", "tcp", "--sport", "443", "-j", "ACCEPT"], check=True)
+        
+        # Block websites based on domains (basic DNS blocking)
+        for site in blocked_sites:
+            subprocess.run(["iptables", "-A", "OUTPUT", "-d", site, "-j", "DROP"], check=True)
+        
+        logger.info("Iptables setup complete.")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[ERROR] Failed to setup iptables: {e}")
+
+# Setup Fail2Ban to block brute-force attempts
+def setup_fail2ban():
+    logger.info("Setting up Fail2Ban...")
+    try:
+        # Example: Ban IP for 1 hour if too many failed login attempts
+        subprocess.run(["fail2ban-client", "start"], check=True)
+        logger.info("Fail2Ban setup complete.")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[ERROR] Failed to setup Fail2Ban: {e}")
+
+# Packet inspection function for NetfilterQueue
+def inspect_packet(pkt):
+    packet = IP(pkt.get_payload())
+    logger.info(f"Inspecting packet: {packet.summary()}")
+    
+    # Block based on IP
+    if packet.src in blocked_ips or packet.dst in blocked_ips:
+        logger.warning(f"Blocked packet from IP: {packet.src} -> {packet.dst}")
+        pkt.drop()
+        return
+    
+    # Block based on ports
+    if packet.haslayer(TCP):
+        if packet.dport in blocked_ports or packet.sport in blocked_ports:
+            logger.warning(f"Blocked packet on port: {packet.dport}")
+            pkt.drop()
+            return
+    
+    # Block based on keywords in the packet payload
+    if packet.haslayer(Raw):
+        payload = str(packet[Raw].load)
+        for keyword in blocked_keywords:
+            if keyword in payload:
+                logger.warning(f"Blocked packet with keyword: {keyword}")
+                pkt.drop()
+                return
+
+    # Allow packet if no conditions are matched
+    pkt.accept()
+
+# Start the packet filtering process with NetfilterQueue
+def start_packet_filtering():
+    logger.info("Starting packet filtering...")
     nfqueue = NetfilterQueue()
     nfqueue.bind(1, inspect_packet)
-
     try:
-        logger.info("🔥 Hybrid Firewall is running. Press Ctrl+C to stop.")
         nfqueue.run()
-    except KeyboardInterrupt:
-        logger.info("🛑 Firewall stopped by user.")
-        nfqueue.unbind()
-        sys.exit(0)
+    except Exception as e:
+        logger.error(f"[ERROR] NetfilterQueue failed: {e}")
+
+# Main function to setup and run the firewall
+def main():
+    setup_iptables()
+    setup_fail2ban()
+    update_blocklists()  # Ensure blocklists are updated
+    start_packet_filtering()
+
+if __name__ == "__main__":
+    main()
