@@ -163,4 +163,6 @@ def update_blocklists():
             os.replace(temp_file, filename)
             logger.info(f"[INFO] Updated {filename}.")
         except subprocess.CalledProcessError as e:
-            logger.error(f"[ERROR] Failed to update
+            logger.error(
+                f"[ERROR] Failed to update rules: {e}"
+            )
