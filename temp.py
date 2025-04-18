@@ -166,3 +166,22 @@ def update_blocklists():
             logger.error(
                 f"[ERROR] Failed to update rules: {e}"
             )
+# 🔹 Main Firewall Loop
+if __name__ == "__main__":
+    sanity_check()
+    update_blocklists()
+    reload_blocklists()
+    setup_fail2ban()
+    setup_squid_proxy()
+    setup_iptables()
+
+    nfqueue = NetfilterQueue()
+    nfqueue.bind(1, inspect_packet)
+
+    try:
+        logger.info("🔥 Hybrid Firewall is running. Press Ctrl+C to stop.")
+        nfqueue.run()
+    except KeyboardInterrupt:
+        logger.info("🛑 Firewall stopped by user.")
+        nfqueue.unbind()
+        sys.exit(0)
